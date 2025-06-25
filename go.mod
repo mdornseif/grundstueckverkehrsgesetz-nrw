@@ -1,6 +1,6 @@
 module grundstueckverkehrsgesetz
 
-go 1.24.2
+go 1.23
 
 require (
 	github.com/antchfx/htmlquery v1.3.4
