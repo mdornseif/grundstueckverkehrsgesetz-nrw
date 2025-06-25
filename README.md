@@ -1,6 +1,6 @@
 # Grundstückverkehrsgesetz Website Monitor
 
-Ein Go-Programm zur Überwachung der Website [http://www.grundstueckverkehrsgesetz.nrw.de](http://www.grundstueckverkehrsgesetz.nrw.de) auf neue Links.
+Ein Go-Programm zur Überwachung der Website [http://www.grundstueckverkehrsgesetz.nrw.de](http://www.grundstueckverkehrsgesetz.nrw.de) auf neue Links. Größtenteils Auto-Generiert.
 
 ## Funktionen
 
