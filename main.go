@@ -33,8 +33,9 @@ type Config struct {
 
 // LinkData speichert die gefundenen Links
 type LinkData struct {
-	Links    []string  `json:"links"`
-	LastSeen time.Time `json:"last_seen"`
+	Links       []string  `json:"links"`
+	FailedLinks []string  `json:"failed_links"` // Links die beim Posten fehlgeschlagen sind
+	LastSeen    time.Time `json:"last_seen"`
 }
 
 // LemmyLoginResponse ist die Antwortstruktur für den Lemmy-Login
@@ -102,8 +103,9 @@ func loadLinkData(filename string) (LinkData, error) {
 		if os.IsNotExist(err) {
 			// Datei existiert nicht, erstelle leere Daten
 			return LinkData{
-				Links:    []string{},
-				LastSeen: time.Now(),
+				Links:       []string{},
+				FailedLinks: []string{},
+				LastSeen:    time.Now(),
 			}, nil
 		}
 		return data, fmt.Errorf("Fehler beim Lesen der Link-Datei: %v", err)
@@ -112,6 +114,11 @@ func loadLinkData(filename string) (LinkData, error) {
 	err = json.Unmarshal(file, &data)
 	if err != nil {
 		return data, fmt.Errorf("Fehler beim Parsen der Link-Datei: %v", err)
+	}
+
+	// Stelle sicher, dass FailedLinks initialisiert ist (für alte Dateien)
+	if data.FailedLinks == nil {
+		data.FailedLinks = []string{}
 	}
 
 	return data, nil
@@ -194,7 +201,7 @@ func extractLinks(htmlContent string, ignoreDirs []string) ([]string, error) {
 }
 
 // findNewLinks findet neue Links im Vergleich zu den gespeicherten
-func findNewLinks(currentLinks, savedLinks []string) []string {
+func findNewLinks(currentLinks, savedLinks, failedLinks []string) []string {
 	savedMap := make(map[string]bool)
 	for _, link := range savedLinks {
 		savedMap[link] = true
@@ -205,6 +212,11 @@ func findNewLinks(currentLinks, savedLinks []string) []string {
 		if !savedMap[link] {
 			newLinks = append(newLinks, link)
 		}
+	}
+
+	// Füge fehlgeschlagene Links hinzu, die erneut versucht werden sollen
+	for _, link := range failedLinks {
+		newLinks = append(newLinks, link)
 	}
 
 	return newLinks
@@ -386,8 +398,16 @@ func checkWebsite(config Config, testMode bool) error {
 		return err
 	}
 
-	// Neue Links finden
-	newLinks := findNewLinks(currentLinks, savedData.Links)
+	// Neue Links finden (inklusive fehlgeschlagene Links)
+	newLinks := findNewLinks(currentLinks, savedData.Links, savedData.FailedLinks)
+	
+	// Logge fehlgeschlagene Links, die erneut versucht werden
+	if len(savedData.FailedLinks) > 0 {
+		log.Printf("🔄 Fehlgeschlagene Links werden erneut versucht (%d):", len(savedData.FailedLinks))
+		for i, link := range savedData.FailedLinks {
+			log.Printf("  %d. %s", i+1, link)
+		}
+	}
 	// Entfernte Links finden
 	removedLinks := findRemovedLinks(currentLinks, savedData.Links)
 
@@ -396,6 +416,9 @@ func checkWebsite(config Config, testMode bool) error {
 	var communityID int
 	if len(newLinks) > 0 {
 		log.Printf("🚨 NEUE LINKS GEFUNDEN (%d):", len(newLinks))
+		
+		// Fehlgeschlagene Links für diesen Durchgang zurücksetzen
+		savedData.FailedLinks = []string{}
 
 		// Lemmy-Login nur einmal pro Check durchführen
 		if config.LemmyToken != "" && time.Now().Before(config.LemmyTokenExp) {
@@ -472,9 +495,12 @@ func checkWebsite(config Config, testMode bool) error {
 					if !testMode {
 						err = lemmyCreatePost(config.LemmyServer, jwt, communityID, title, text, pageURL)
 						if err != nil {
-							log.Printf("    Fehler beim Erstellen des Lemmy-Posts: %v", err)
+							log.Printf("    ❌ Fehler beim Erstellen des Lemmy-Posts: %v", err)
+							log.Printf("    🔄 Link wird beim nächsten Durchgang erneut versucht: %s", link)
+							savedData.FailedLinks = append(savedData.FailedLinks, link)
 						} else {
-							log.Printf("    Lemmy-Post erfolgreich erstellt für %s", link)
+							log.Printf("    ✅ Lemmy-Post erfolgreich erstellt für %s", link)
+							savedData.Links = append(savedData.Links, link) // Nur erfolgreiche Links speichern
 						}
 					} else {
 						// Test-Modus: Zeige was gepostet werden würde
@@ -504,14 +530,28 @@ func checkWebsite(config Config, testMode bool) error {
 		for i, link := range removedLinks {
 			log.Printf("  %d. %s", i+1, link)
 		}
+		
+		// Entferne gelöschte Links aus der gespeicherten Liste
+		currentMap := make(map[string]bool)
+		for _, link := range currentLinks {
+			currentMap[link] = true
+		}
+		
+		var updatedLinks []string
+		for _, link := range savedData.Links {
+			if currentMap[link] {
+				updatedLinks = append(updatedLinks, link)
+			}
+		}
+		savedData.Links = updatedLinks
 	}
 
 	if len(newLinks) == 0 && len(removedLinks) == 0 {
 		log.Printf("Keine Änderungen gefunden")
 	}
 
-	// Aktuelle Links speichern (entfernte Links werden automatisch entfernt)
-	savedData.Links = currentLinks
+	// Aktuelle Links speichern (nur erfolgreich gepostete Links bleiben in der Liste)
+	// Entfernte Links werden automatisch entfernt, da sie nicht mehr in currentLinks sind
 	savedData.LastSeen = time.Now()
 
 	err = saveLinkData(savedData, config.DataFile)
