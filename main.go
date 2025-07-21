@@ -16,6 +16,7 @@ import (
 
 	"github.com/antchfx/htmlquery"
 	"golang.org/x/net/html"
+	"bufio"
 )
 
 // Config enthält die Konfiguration für das Programm
@@ -580,6 +581,9 @@ func checkWebsite(config Config, testMode bool) error {
 						}
 					}
 					if mastodonToken == "" {
+						if config.MastodonUsername != "" || config.MastodonPassword != "" || config.MastodonClientID != "" || config.MastodonClientSecret != "" {
+							log.Printf("    ❌ Mastodon: Kein Access Token verfügbar und Login mit Username/Passwort/ClientID/Secret nicht möglich (z.B. GoToSocial). Bitte ein App-Passwort (mastodon_access_token) verwenden.")
+						}
 						log.Printf("    ❌ Kein Mastodon-Token verfügbar, Mastodon-Post übersprungen.")
 						mastodonSuccess = false
 						postErrs = append(postErrs, "Mastodon: Kein Token")
@@ -871,6 +875,71 @@ func savePostAsJSON(title, markdown, url, community string) error {
 	return os.WriteFile(filename, data, 0644)
 }
 
+func printMastodonAuthURL(config Config) {
+	if config.MastodonServer == "" || config.MastodonClientID == "" {
+		fmt.Println("mastodon_server und mastodon_client_id müssen in der Konfiguration gesetzt sein.")
+		return
+	}
+	url := fmt.Sprintf("%soauth/authorize?client_id=%s&redirect_uri=urn:ietf:wg:oauth:2.0:oob&response_type=code&scope=write", config.MastodonServer, config.MastodonClientID)
+	fmt.Println("Öffne folgende URL im Browser, um den Authorization Code zu erhalten:")
+	fmt.Println(url)
+}
+
+func obtainMastodonTokenInteractive(config *Config) error {
+	if config.MastodonServer == "" || config.MastodonClientID == "" || config.MastodonClientSecret == "" {
+		return fmt.Errorf("mastodon_server, mastodon_client_id und mastodon_client_secret müssen gesetzt sein")
+	}
+	redirectURI := "urn:ietf:wg:oauth:2.0:oob"
+	scope := "write"
+
+	authURL := fmt.Sprintf("%soauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s", config.MastodonServer, config.MastodonClientID, redirectURI, scope)
+	fmt.Println("Bitte öffne folgende URL im Browser, logge dich ein und erlaube den Zugriff:")
+	fmt.Println(authURL)
+	fmt.Print("Gib den angezeigten Code ein: ")
+	reader := bufio.NewReader(os.Stdin)
+	code, _ := reader.ReadString('\n')
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return fmt.Errorf("Kein Code eingegeben")
+	}
+
+	// Tausche Code gegen Access Token
+	payload := map[string]string{
+		"redirect_uri": redirectURI,
+		"client_id": config.MastodonClientID,
+		"client_secret": config.MastodonClientSecret,
+		"grant_type": "authorization_code",
+		"code": code,
+	}
+	data, _ := json.Marshal(payload)
+	resp, err := http.Post(config.MastodonServer+"oauth/token", "application/json", strings.NewReader(string(data)))
+	if err != nil {
+		return fmt.Errorf("Fehler beim Token-Austausch: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("Token-Austausch fehlgeschlagen: %s", string(body))
+	}
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return fmt.Errorf("Fehler beim Parsen der Token-Antwort: %v", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return fmt.Errorf("Kein Access Token erhalten")
+	}
+	config.MastodonAccessToken = tokenResp.AccessToken
+	config.MastodonToken = tokenResp.AccessToken
+	if tokenResp.ExpiresIn > 0 {
+		config.MastodonTokenExp = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	}
+	fmt.Println("Access Token erfolgreich erhalten und gespeichert.")
+	return saveConfig(*config, "config.json")
+}
+
 func main() {
 	// Command line flags
 	var loopMode = flag.Bool("loop", false, "Run in continuous monitoring mode")
@@ -883,14 +952,13 @@ func main() {
 		log.Fatalf("Fehler beim Laden der Konfiguration: %v", err)
 	}
 
-	// Konfiguration speichern (falls sie nicht existierte)
-	err = saveConfig(config, "config.json")
-	if err != nil {
-		log.Printf("Warnung: Konfiguration konnte nicht gespeichert werden: %v", err)
-	}
-
-	if *testMode {
-		log.Printf("🧪 TEST-MODUS: Keine Posts werden an Lemmy gesendet!")
+	// Mastodon OAuth2-Flow automatisch durchführen, wenn kein Token vorhanden ist, aber Server und ClientID/Secret gesetzt sind
+	if config.MastodonServer != "" && config.MastodonClientID != "" && config.MastodonClientSecret != "" && config.MastodonAccessToken == "" && config.MastodonToken == "" {
+		err := obtainMastodonTokenInteractive(&config)
+		if err != nil {
+			log.Fatalf("Fehler beim Mastodon-OAuth2-Flow: %v", err)
+		}
+		// Nach erfolgreichem Token-Erhalt: Programm normal fortsetzen
 	}
 
 	if *loopMode {
