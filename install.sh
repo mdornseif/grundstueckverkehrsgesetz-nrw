@@ -100,33 +100,47 @@ compile_program() {
 
 install_program() {
     echo "Installiere Programm..."
-    
-    sudo cp monitor /usr/local/bin/grundstueckverkehrsgesetz-monitor
-    sudo chown $SERVICE_USER:$SERVICE_GROUP /usr/local/bin/grundstueckverkehrsgesetz-monitor
-    sudo chmod +x /usr/local/bin/grundstueckverkehrsgesetz-monitor
-    
+
+    TARGET=/usr/local/bin/grundstueckverkehrsgesetz-monitor
+    BACKUP=/usr/local/bin/grundstueckverkehrsgesetz-monitor.old
+
+    if [ -f "$TARGET" ]; then
+        echo "Verschiebe laufende alte Version nach $BACKUP ..."
+        sudo mv -f "$TARGET" "$BACKUP"
+    fi
+
+    sudo cp monitor "$TARGET"
+    sudo chown $SERVICE_USER:$SERVICE_GROUP "$TARGET"
+    sudo chmod +x "$TARGET"
+
     echo "Programm installiert"
 }
 
 copy_config_files() {
     echo "Kopiere Konfigurationsdateien..."
-    
-    if [ -f "config.json" ]; then
+
+    # config.json
+    if [ -f "/opt/grundstueckverkehrsgesetz/config.json" ]; then
+        echo "/opt/grundstueckverkehrsgesetz/config.json existiert bereits - wird NICHT überschrieben."
+    elif [ -f "config.json" ]; then
         sudo cp config.json /opt/grundstueckverkehrsgesetz/
         sudo chown $SERVICE_USER:$SERVICE_GROUP /opt/grundstueckverkehrsgesetz/config.json
         sudo chmod 644 /opt/grundstueckverkehrsgesetz/config.json
     else
         echo "config.json nicht gefunden - wird beim ersten Start erstellt"
     fi
-    
-    if [ -f "links.json" ]; then
+
+    # links.json
+    if [ -f "/opt/grundstueckverkehrsgesetz/links.json" ]; then
+        echo "/opt/grundstueckverkehrsgesetz/links.json existiert bereits - wird NICHT überschrieben."
+    elif [ -f "links.json" ]; then
         sudo cp links.json /opt/grundstueckverkehrsgesetz/
         sudo chown $SERVICE_USER:$SERVICE_GROUP /opt/grundstueckverkehrsgesetz/links.json
         sudo chmod 644 /opt/grundstueckverkehrsgesetz/links.json
     else
         echo "links.json nicht gefunden - wird beim ersten Start erstellt"
     fi
-    
+
     echo "Konfigurationsdateien kopiert"
 }
 

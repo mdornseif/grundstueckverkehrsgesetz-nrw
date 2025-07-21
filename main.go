@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,17 @@ type Config struct {
 	LemmyToken     string        `json:"lemmy_token"`
 	LemmyTokenExp  time.Time     `json:"lemmy_token_exp"`
 	IgnoreDirs     []string      `json:"ignore_dirs"`
+
+	// Mastodon-Konfiguration
+	MastodonServer      string    `json:"mastodon_server"`
+	MastodonAccessToken string    `json:"mastodon_access_token"` // Optional, wird überschrieben, wenn Username/Passwort genutzt wird
+	MastodonUsername    string    `json:"mastodon_username"`
+	MastodonPassword    string    `json:"mastodon_password"`
+	MastodonClientID    string    `json:"mastodon_client_id"`
+	MastodonClientSecret string   `json:"mastodon_client_secret"`
+	MastodonToken       string    `json:"mastodon_token"`
+	MastodonTokenExp    time.Time `json:"mastodon_token_exp"`
+	MastodonVisibility  string    `json:"mastodon_visibility"` // z.B. "public", "unlisted", "private", "direct"
 }
 
 // LinkData speichert die gefundenen Links
@@ -64,6 +76,16 @@ func DefaultConfig() Config {
 		LemmyToken:     "",
 		LemmyTokenExp:  time.Time{},
 		IgnoreDirs:     []string{"guetersloh"},
+
+		MastodonServer:      "",
+		MastodonAccessToken: "",
+		MastodonUsername:    "",
+		MastodonPassword:    "",
+		MastodonClientID:    "",
+		MastodonClientSecret: "",
+		MastodonToken:       "",
+		MastodonTokenExp:    time.Time{},
+		MastodonVisibility:  "unlisted",
 	}
 }
 
@@ -481,29 +503,46 @@ func checkWebsite(config Config, testMode bool) error {
 
 			if text != "" {
 				log.Printf("--- Auszug aus %s ---\n%s\n--------------------------", link, text)
-				if jwt != "" {
+
+				// --- NEU: Plattform-Checks ---
+				lemmyConfigured := config.LemmyServer != "" && config.LemmyCommunity != "" && config.LemmyUsername != "" && config.LemmyPassword != ""
+				mastodonConfigured := config.MastodonServer != "" && config.MastodonAccessToken != ""
+
+				if !lemmyConfigured && !mastodonConfigured {
+					log.Printf("    ❌ Weder Lemmy noch Mastodon sind konfiguriert. Link wird nicht als erledigt markiert.")
+					savedData.FailedLinks = append(savedData.FailedLinks, link)
+					continue
+				}
+
+				var postErrs []string
+				lemmySuccess := true
+				mastodonSuccess := true
+
+				// --- Lemmy Post ---
+				if lemmyConfigured {
 					title := cityName + ": Grundstücksverkauf an Nicht-LandwirtIn"
 					if cityName == "" {
 						title = strings.Title(strings.Split(link, "/")[0]) + ": Grundstücksverkauf an Nicht-LandwirtIn"
 					}
-
-					// Überschrift zum Titel hinzufügen, falls vorhanden
 					if extractedTitle != "" {
 						title += " " + extractedTitle
 					}
-
 					if !testMode {
-						err = lemmyCreatePost(config.LemmyServer, jwt, communityID, title, text, pageURL)
-						if err != nil {
-							log.Printf("    ❌ Fehler beim Erstellen des Lemmy-Posts: %v", err)
-							log.Printf("    🔄 Link wird beim nächsten Durchgang erneut versucht: %s", link)
-							savedData.FailedLinks = append(savedData.FailedLinks, link)
+						if jwt != "" {
+							err = lemmyCreatePost(config.LemmyServer, jwt, communityID, title, text, pageURL)
+							if err != nil {
+								log.Printf("    ❌ Fehler beim Erstellen des Lemmy-Posts: %v", err)
+								lemmySuccess = false
+								postErrs = append(postErrs, "Lemmy: "+err.Error())
+							} else {
+								log.Printf("    ✅ Lemmy-Post erfolgreich erstellt für %s", link)
+							}
 						} else {
-							log.Printf("    ✅ Lemmy-Post erfolgreich erstellt für %s", link)
-							savedData.Links = append(savedData.Links, link) // Nur erfolgreiche Links speichern
+							log.Printf("    ❌ Kein gültiges Lemmy-Token, Lemmy-Post übersprungen.")
+							lemmySuccess = false
+							postErrs = append(postErrs, "Lemmy: Kein gültiges Token")
 						}
 					} else {
-						// Test-Modus: Zeige was gepostet werden würde
 						log.Printf("🧪 TEST: Lemmy-Post würde erstellt werden:")
 						log.Printf("    Server: %s", config.LemmyServer)
 						log.Printf("    Community: %s (ID: %d)", config.LemmyCommunity, communityID)
@@ -518,6 +557,70 @@ func checkWebsite(config Config, testMode bool) error {
 						log.Printf("%s", text)
 						log.Printf("    ---")
 					}
+				}
+
+				// --- Mastodon Post ---
+				if mastodonConfigured {
+					// Token-Handling wie bei Lemmy
+					mastodonToken := config.MastodonAccessToken
+					if mastodonToken == "" || (config.MastodonToken != "" && time.Now().After(config.MastodonTokenExp)) {
+						if config.MastodonUsername != "" && config.MastodonPassword != "" && config.MastodonClientID != "" && config.MastodonClientSecret != "" {
+							log.Printf("    Mastodon: Hole neues Access Token per Passwort...")
+							token, exp, err := mastodonLogin(config.MastodonServer, config.MastodonClientID, config.MastodonClientSecret, config.MastodonUsername, config.MastodonPassword)
+							if err != nil {
+								log.Printf("    ❌ Fehler beim Mastodon-Login: %v", err)
+								mastodonSuccess = false
+								postErrs = append(postErrs, "Mastodon-Login: "+err.Error())
+							} else {
+								mastodonToken = token
+								config.MastodonToken = token
+								config.MastodonTokenExp = exp
+								log.Printf("    Mastodon: Neues Token geholt und gespeichert (gültig bis %v)", exp)
+							}
+						}
+					}
+					if mastodonToken == "" {
+						log.Printf("    ❌ Kein Mastodon-Token verfügbar, Mastodon-Post übersprungen.")
+						mastodonSuccess = false
+						postErrs = append(postErrs, "Mastodon: Kein Token")
+					} else if !testMode {
+						mastodonText := text
+						if cityName != "" {
+							mastodonText = cityName + ": Grundstücksverkauf an Nicht-LandwirtIn\n" + text
+						}
+						err = mastodonCreatePost(config.MastodonServer, mastodonToken, mastodonText, config.MastodonVisibility)
+						if err != nil {
+							log.Printf("    ❌ Fehler beim Erstellen des Mastodon-Posts: %v", err)
+							mastodonSuccess = false
+							postErrs = append(postErrs, "Mastodon: "+err.Error())
+						} else {
+							log.Printf("    ✅ Mastodon-Post erfolgreich erstellt für %s", link)
+						}
+					} else if testMode {
+						mastodonText := text
+						if cityName != "" {
+							mastodonText = cityName + ": Grundstücksverkauf an Nicht-LandwirtIn\n" + text
+						}
+						log.Printf("🧪 TEST: Mastodon-Post würde erstellt werden:")
+						log.Printf("    Server: %s", config.MastodonServer)
+						log.Printf("    Sichtbarkeit: %s", config.MastodonVisibility)
+						log.Printf("    Text (erste 200 Zeichen): %s", truncateString(mastodonText, 200))
+						if len(mastodonText) > 200 {
+							log.Printf("    ... (Text ist %d Zeichen lang)", len(mastodonText))
+						}
+						log.Printf("    Vollständiger Text:")
+						log.Printf("    ---")
+						log.Printf("%s", mastodonText)
+						log.Printf("    ---")
+					}
+				}
+
+				if (lemmyConfigured && !lemmySuccess) || (mastodonConfigured && !mastodonSuccess) {
+					log.Printf("    ❌ Mindestens ein Post fehlgeschlagen (%s). Link wird erneut versucht.", strings.Join(postErrs, "; "))
+					savedData.FailedLinks = append(savedData.FailedLinks, link)
+				} else {
+					log.Printf("    ✅ Link erfolgreich auf allen konfigurierten Plattformen gepostet: %s", link)
+					savedData.Links = append(savedData.Links, link)
 				}
 			} else {
 				log.Printf("    Kein Text zwischen <hr>-Tags gefunden")
@@ -685,6 +788,67 @@ func lemmyCreatePost(serverURL, jwt string, communityID int, title, body, url st
 		return fmt.Errorf("Post-Erstellung HTTP %d - Antwort: %s", resp.StatusCode, string(body))
 	}
 	log.Printf("Post-Erstellung %s HTTP %d - Antwort: %s", payload, resp.StatusCode, string(body))
+	return nil
+}
+
+// mastodonLogin holt ein Access Token per OAuth2 Password Grant
+func mastodonLogin(server, clientID, clientSecret, username, password string) (string, time.Time, error) {
+	tokenURL := server + "/oauth/token"
+	payload := url.Values{}
+	payload.Set("grant_type", "password")
+	payload.Set("client_id", clientID)
+	payload.Set("client_secret", clientSecret)
+	payload.Set("username", username)
+	payload.Set("password", password)
+	payload.Set("scope", "read write")
+
+	resp, err := http.PostForm(tokenURL, payload)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("Mastodon-Login fehlgeschlagen: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("Fehler beim Lesen der Mastodon-Login-Antwort: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		return "", time.Time{}, fmt.Errorf("Mastodon-Login HTTP %d - Antwort: %s", resp.StatusCode, string(body))
+	}
+	var tokenResp struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return "", time.Time{}, fmt.Errorf("Mastodon-Login JSON-Fehler: %v - Antwort: %s", err, string(body))
+	}
+	exp := time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second)
+	return tokenResp.AccessToken, exp, nil
+}
+
+// mastodonCreatePost erstellt einen neuen Beitrag auf Mastodon
+func mastodonCreatePost(server, token, text, visibility string) error {
+	apiUrl := server + "/api/v1/statuses"
+	payload := map[string]interface{}{
+		"status":     text,
+		"visibility": visibility,
+	}
+	data, _ := json.Marshal(payload)
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", apiUrl, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Mastodon-Post HTTP %d - Antwort: %s", resp.StatusCode, string(body))
+	}
 	return nil
 }
 
