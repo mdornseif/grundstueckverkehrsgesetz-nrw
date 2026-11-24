@@ -32,7 +32,7 @@ Nur dann ist der Button „Request access token“ im Webinterface aktiv und du 
 ## Beispielkonfiguration (`config.json`)
 ```json
 {
-  "url": "http://www.grundstueckverkehrsgesetz.nrw.de",
+  "url": "https://www.landwirtschaftskammer.de/extern/grundstuecke/index.htm",
   "check_interval": 43200,
   "data_file": "links.json",
   "lemmy_server": "https://lemmy.example.org",

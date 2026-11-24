@@ -10,8 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"math/rand"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/antchfx/htmlquery"
@@ -64,10 +68,15 @@ type LemmyPostResponse struct {
 	} `json:"post_view"`
 }
 
+// DefaultURL ist die Übersichtsseite der GVG-Veröffentlichungen. Die alte Domain
+// www.grundstueckverkehrsgesetz.nrw.de leitet seit November 2026 auf eine
+// fremde Seite der Landwirtschaftskammer um.
+const DefaultURL = "https://www.landwirtschaftskammer.de/extern/grundstuecke/index.htm"
+
 // DefaultConfig gibt die Standard-Konfiguration zurück
 func DefaultConfig() Config {
 	return Config{
-		URL:            "http://www.grundstueckverkehrsgesetz.nrw.de",
+		URL:            DefaultURL,
 		CheckInterval:  12 * time.Hour,
 		DataFile:       "links.json",
 		LemmyServer:    "https://natur.23.nu",
@@ -157,29 +166,150 @@ func saveLinkData(data LinkData, filename string) error {
 	return os.WriteFile(filename, jsonData, 0644)
 }
 
-// fetchURL ruft eine URL ab und gibt den HTML-Inhalt zurück
-func fetchURL(url string) (string, error) {
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-	}
+const (
+	userAgent       = "gvg-nrw-monitor/1.1 (+https://forge.23.nu/md/grundstueckverkehrsgesetz-nrw)"
+	minFetchGap     = 2 * time.Second  // Mindestabstand zwischen zwei Abrufen
+	maxFetchTries   = 5                // Versuche pro URL
+	maxBackoff      = 2 * time.Minute  // Obergrenze nur für den eigenen Backoff
+	maxRetryAfter   = 10 * time.Minute // längere Retry-After-Fristen: aufgeben
+)
 
-	resp, err := client.Get(url)
-	if err != nil {
-		return "", fmt.Errorf("Fehler beim Abrufen der URL %s: %v", url, err)
-	}
-	defer resp.Body.Close()
+var (
+	fetchMu   sync.Mutex
+	lastFetch time.Time
+)
 
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP-Fehler %d für URL %s", resp.StatusCode, url)
+// waitFetchSlot sorgt dafür, dass Abrufe sequentiell und mit Abstand erfolgen.
+func waitFetchSlot() {
+	if d := time.Until(lastFetch.Add(minFetchGap)); d > 0 {
+		time.Sleep(d)
 	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("Fehler beim Lesen der Antwort: %v", err)
-	}
-
-	return string(body), nil
+	lastFetch = time.Now()
 }
+
+// fetchURL ruft eine URL höflich ab (User-Agent, Mindestabstand, Exponential
+// Backoff bei 429/5xx/Netzfehlern, Retry-After wird voll respektiert) und gibt
+// den HTML-Inhalt sowie die URL nach allen Umleitungen zurück.
+func fetchURL(rawURL string) (string, string, error) {
+	fetchMu.Lock()
+	defer fetchMu.Unlock()
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	backoff := 2 * time.Second
+	var lastErr error
+
+	for attempt := 1; attempt <= maxFetchTries; attempt++ {
+		waitFetchSlot()
+
+		req, err := http.NewRequest("GET", rawURL, nil)
+		if err != nil {
+			return "", "", fmt.Errorf("Ungültige URL %s: %v", rawURL, err)
+		}
+		req.Header.Set("User-Agent", userAgent)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("Fehler beim Abrufen der URL %s: %v", rawURL, err)
+		} else {
+			body, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			finalURL := resp.Request.URL.String()
+
+			switch {
+			case resp.StatusCode == http.StatusOK:
+				if readErr != nil {
+					lastErr = fmt.Errorf("Fehler beim Lesen der Antwort: %v", readErr)
+					break
+				}
+				return string(body), finalURL, nil
+			case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+				lastErr = fmt.Errorf("HTTP-Fehler %d für URL %s", resp.StatusCode, rawURL)
+				if ra := resp.Header.Get("Retry-After"); ra != "" {
+					wait, ok := parseRetryAfter(ra)
+					if !ok || wait > maxRetryAfter {
+						return "", "", fmt.Errorf("%v – Server verlangt Retry-After %q, gebe auf", lastErr, ra)
+					}
+					log.Printf("    %v – warte %v (Retry-After)", lastErr, wait)
+					time.Sleep(wait)
+					continue
+				}
+			default:
+				// 4xx usw.: Wiederholen bringt nichts
+				return "", finalURL, fmt.Errorf("HTTP-Fehler %d für URL %s", resp.StatusCode, rawURL)
+			}
+		}
+
+		if attempt == maxFetchTries {
+			break
+		}
+		wait := backoff + time.Duration(rand.Int63n(int64(time.Second)))
+		log.Printf("    %v – neuer Versuch in %v", lastErr, wait.Round(time.Millisecond))
+		time.Sleep(wait)
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+	return "", "", fmt.Errorf("Aufgegeben nach %d Versuchen: %v", maxFetchTries, lastErr)
+}
+
+// parseRetryAfter wertet einen Retry-After-Header (Sekunden oder HTTP-Datum) aus.
+func parseRetryAfter(v string) (time.Duration, bool) {
+	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			d = 0
+		}
+		return d, true
+	}
+	return 0, false
+}
+
+// gvgMarker muss im Titel der Übersichtsseite stehen. Fehlt er, wurden wir
+// vermutlich auf eine andere Seite umgeleitet (so geschehen im November 2026:
+// alle Navigationslinks der Naturschutz-Seite wurden als „Grundstücke“ gepostet).
+const gvgMarker = "Grundstückverkehrsgesetz"
+
+// checkOverviewPage prüft, ob der abgerufene Inhalt wirklich die GVG-Übersicht ist.
+func checkOverviewPage(htmlContent, finalURL string) error {
+	doc, err := htmlquery.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		return fmt.Errorf("Fehler beim Parsen des HTML: %v", err)
+	}
+	title := ""
+	if n := htmlquery.FindOne(doc, "//title"); n != nil {
+		title = strings.TrimSpace(htmlquery.InnerText(n))
+	}
+	if !strings.Contains(title, gvgMarker) {
+		return fmt.Errorf("Übersichtsseite sieht nicht nach GVG-Veröffentlichungen aus (gelandet auf %s, Titel %q) – ist die Seite umgezogen? Es wird nichts gepostet und nichts gespeichert", finalURL, title)
+	}
+	return nil
+}
+
+// resolveDetailURL bildet die absolute URL einer Detailseite und stellt sicher,
+// dass sie unterhalb des Verzeichnisses der Übersichtsseite liegt.
+func resolveDetailURL(overviewURL, link string) (string, error) {
+	base, err := url.Parse(overviewURL)
+	if err != nil {
+		return "", err
+	}
+	ref, err := url.Parse(link)
+	if err != nil {
+		return "", err
+	}
+	abs := base.ResolveReference(ref)
+	baseDir := base.Path[:strings.LastIndex(base.Path, "/")+1]
+	if abs.Host != base.Host || !strings.HasPrefix(abs.Path, baseDir) {
+		return "", fmt.Errorf("Link %s zeigt aus dem GVG-Bereich heraus (%s)", link, abs)
+	}
+	return abs.String(), nil
+}
+
+// kreisLinkRe erkennt Links auf Kreis-Seiten, z.B. "dueren/index.htm".
+var kreisLinkRe = regexp.MustCompile(`^([A-Za-z0-9_-]+)/index\.htm$`)
 
 // extractLinks extrahiert alle Links aus dem HTML-Inhalt
 func extractLinks(htmlContent string, ignoreDirs []string) ([]string, error) {
@@ -195,29 +325,28 @@ func extractLinks(htmlContent string, ignoreDirs []string) ([]string, error) {
 	}
 
 	var links []string
+	seen := make(map[string]bool)
 	for _, node := range nodes {
-		href := htmlquery.SelectAttr(node, "href")
-		if href != "" && !strings.HasPrefix(href, "#") && !strings.HasPrefix(href, "javascript:") {
-			// Nur Links zu Unterverzeichnissen mit index.htm filtern
-			if strings.Contains(href, "/") && strings.HasSuffix(href, "/index.htm") {
-				// Verzeichnisname extrahieren
-				parts := strings.Split(href, "/")
-				if len(parts) > 1 {
-					dir := parts[0]
-					ignore := false
-					for _, ign := range ignoreDirs {
-						if strings.EqualFold(dir, ign) {
-							ignore = true
-							break
-						}
-					}
-					if ignore {
-						continue
-					}
-				}
-				links = append(links, href)
+		href := strings.TrimSpace(htmlquery.SelectAttr(node, "href"))
+		// Nur Kreis-Seiten der Form "<kreis>/index.htm" (keine "../", keine
+		// absoluten URLs, keine Navigation der umgebenden Website)
+		m := kreisLinkRe.FindStringSubmatch(href)
+		if m == nil {
+			continue
+		}
+		dir := m[1]
+		ignore := false
+		for _, ign := range ignoreDirs {
+			if strings.EqualFold(dir, ign) {
+				ignore = true
+				break
 			}
 		}
+		if ignore || seen[href] {
+			continue
+		}
+		seen[href] = true
+		links = append(links, href)
 	}
 
 	return links, nil
@@ -231,15 +360,25 @@ func findNewLinks(currentLinks, savedLinks, failedLinks []string) []string {
 	}
 
 	var newLinks []string
+	added := make(map[string]bool)
 	for _, link := range currentLinks {
-		if !savedMap[link] {
+		if !savedMap[link] && !added[link] {
 			newLinks = append(newLinks, link)
+			added[link] = true
 		}
 	}
 
 	// Füge fehlgeschlagene Links hinzu, die erneut versucht werden sollen
+	// (nur, wenn sie noch auf der Website stehen und nicht schon enthalten sind)
+	current := make(map[string]bool)
+	for _, link := range currentLinks {
+		current[link] = true
+	}
 	for _, link := range failedLinks {
-		newLinks = append(newLinks, link)
+		if current[link] && !savedMap[link] && !added[link] {
+			newLinks = append(newLinks, link)
+			added[link] = true
+		}
 	}
 
 	return newLinks
@@ -402,8 +541,14 @@ func checkWebsite(config Config, testMode bool) error {
 	log.Printf("Überprüfe Website: %s", config.URL)
 
 	// HTML-Inhalt abrufen
-	htmlContent, err := fetchURL(config.URL)
+	htmlContent, overviewURL, err := fetchURL(config.URL)
 	if err != nil {
+		return err
+	}
+	if overviewURL != config.URL {
+		log.Printf("Hinweis: %s wurde umgeleitet auf %s", config.URL, overviewURL)
+	}
+	if err := checkOverviewPage(htmlContent, overviewURL); err != nil {
 		return err
 	}
 
@@ -477,15 +622,19 @@ func checkWebsite(config Config, testMode bool) error {
 			log.Printf("  %d. %s", i+1, link)
 
 			// Detailseite abrufen und Text extrahieren
-			pageURL := config.URL
-			if !strings.HasSuffix(pageURL, "/") {
-				pageURL += "/"
+			pageURL, err := resolveDetailURL(overviewURL, link)
+			if err != nil {
+				log.Printf("    %v", err)
+				continue
 			}
-			pageURL += link
 			log.Printf("    Abrufe Detailseite: %s", pageURL)
-			pageContent, err := fetchURL(pageURL)
+			pageContent, finalPageURL, err := fetchURL(pageURL)
 			if err != nil {
 				log.Printf("    Fehler beim Abrufen der Detailseite %s: %v", pageURL, err)
+				continue
+			}
+			if finalPageURL != pageURL {
+				log.Printf("    Detailseite %s wurde umgeleitet auf %s – übersprungen", pageURL, finalPageURL)
 				continue
 			}
 			log.Printf("    Detailseite erfolgreich abgerufen, Länge: %d Zeichen", len(pageContent))
