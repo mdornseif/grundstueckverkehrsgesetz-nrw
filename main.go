@@ -486,6 +486,13 @@ func extractTextBetweenHR(htmlContent string) (string, string, error) {
 	return title, text, nil
 }
 
+// stripMarkdown entfernt die Hervorhebungen (**fett**, *kursiv*), die
+// extractTextBetweenHR für Lemmy einfügt. Mastodon/GoToSocial zeigen sie
+// sonst als Sternchen an.
+func stripMarkdown(s string) string {
+	return strings.ReplaceAll(s, "*", "")
+}
+
 // truncateString kürzt einen String auf die angegebene Länge
 func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
@@ -737,9 +744,9 @@ func checkWebsite(config Config, testMode bool) error {
 						mastodonSuccess = false
 						postErrs = append(postErrs, "Mastodon: Kein Token")
 					} else if !testMode {
-						mastodonText := text
+						mastodonText := stripMarkdown(text)
 						if cityName != "" {
-							mastodonText = cityName + ": Grundstücksverkauf an Nicht-LandwirtIn\n" + text
+							mastodonText = cityName + ": Grundstücksverkauf an Nicht-LandwirtIn\n" + stripMarkdown(text)
 						}
 						err = mastodonCreatePost(config.MastodonServer, mastodonToken, mastodonText, config.MastodonVisibility)
 						if err != nil {
@@ -750,9 +757,9 @@ func checkWebsite(config Config, testMode bool) error {
 							log.Printf("    ✅ Mastodon-Post erfolgreich erstellt für %s", link)
 						}
 					} else if testMode {
-						mastodonText := text
+						mastodonText := stripMarkdown(text)
 						if cityName != "" {
-							mastodonText = cityName + ": Grundstücksverkauf an Nicht-LandwirtIn\n" + text
+							mastodonText = cityName + ": Grundstücksverkauf an Nicht-LandwirtIn\n" + stripMarkdown(text)
 						}
 						log.Printf("🧪 TEST: Mastodon-Post würde erstellt werden:")
 						log.Printf("    Server: %s", config.MastodonServer)
